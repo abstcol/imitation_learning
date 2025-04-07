@@ -23,7 +23,7 @@ torch.autograd.set_detect_anomaly(True)
 class Args:
     exp_name:str=os.path.basename(__file__)[:-len(".py")]
     """the name of this experiment"""
-    seed:int =2
+    seed:int =1
     """seed of the experiment"""
     torch_deterministic:bool=True
     """if toggled, 'torch.backends.cudnn.deterministic=False'"""
@@ -42,13 +42,13 @@ class Args:
     """the if of the environment"""
     total_timesteps:int =500000
     """total timesteps of the experiments"""
-    learning_rate:float=2.5e-4
+    learning_rate:float=5e-4
     """the learning rate of the optimizer"""
     num_envs:int=4
     """the number of parallel game environments"""
     num_steps:int=128
     """the number of steps to run in each environment per policy rollout"""
-    anneal_lr:bool=False
+    anneal_lr:bool=True
     """Toggle learning rate annealing for policy and value networks"""
     gamma:float=0.99
     """the discounter factor gamma"""
@@ -56,17 +56,17 @@ class Args:
     """the lambda for the general advantage estimate"""
     num_minibatches:int =4
     """the number of mini-batches"""
-    update_epochs:int =10
+    update_epochs:int =1
     """the K epochs to update the policy"""
     ent_coef:float=0.01
     """coefficient of the entropy"""
-    max_grad_norm:float=0.5
+    max_grad_norm:float=1
     """"""
     clip_coef:float=0.2
     """the surrogate clipping coefficient"""
     clip_vloss:bool=True
     """toggles whether or not to use a clipped loss for the value function"""
-    vf_coef:float=0.05
+    vf_coef:float=0.1
     """coefficient of the value functoin"""
     norm_adv:bool=True
     """Toggles advantages normalization"""
@@ -74,14 +74,11 @@ class Args:
 
     expert_path:str="expert_policy.pth"
     """the weights file name for the expert policy. only work when there is no expert buffer"""
-    discriminator_epochs:int=1
+    discriminator_epochs:int=2
     """the update interval of the D/G"""
-    policy_epochs:int=1
+    policy_epochs:int=2
     """the update interval of the D/G"""
-    expert_buffersize:int=500000
-    """the expert experience buffer size"""
-    expert_buffer_path:str="expert_buffer.pth"
-    """the buffer of expert trajectory. """
+
 
     batch_size:int=0
     """the batch size (computed in runtime)"""
@@ -177,8 +174,8 @@ class ReplayDataset(Dataset):
         self.actions = actions.flatten()
         self.logprobs = logprobs.flatten()
         perm=torch.randperm(expertactions.shape[0])
-        self.expertobs = expertobs.view(-1, *expertobs.shape[2:])[perm]
-        self.expertactions = expertactions.flatten()[perm]
+        self.expertobs = expertobs.view(-1, *obs.shape[2:])
+        self.expertactions = expertactions.flatten()
 
 
     def __len__(self):
@@ -233,55 +230,6 @@ class PPOReplayDataset(Dataset):
         )
 
 
-def get_expert_data(args,envs,run_name,device):
-    if os.path.exists(args.expert_buffer_path):
-        tmp = torch.load(args.expert_buffer_path)
-        expertobs = tmp["obs"].clone().to(device)
-        expertactions = tmp["actions"].clone().to(device)
-        expertlogprobs = tmp["logprobs"].clone().to(device)
-    else:
-        expertobs = torch.zeros((args.expert_buffersize, args.num_envs) + envs.single_observation_space.shape).to(
-            device)
-        expertactions = torch.zeros((args.expert_buffersize, args.num_envs) + envs.single_action_space.shape).to(
-            device)
-        expertlogprobs = torch.zeros((args.expert_buffersize, args.num_envs)).to(device)
-        expertenvs = gym.vector.SyncVectorEnv(
-            [make_env(args.env_id, i, False, run_name + "_expert") for i in range(args.num_envs)]
-        )
-        # env setup
-        # 构造 expert 模型后，加载预训练权重
-        expert = Agent(expertenvs).to(device)
-
-        # 加载预训练模型的参数
-        expert_ckpt_path = args.expert_path  # 你实际的模型路径
-        expert.actor.load_state_dict(torch.load(expert_ckpt_path, map_location=device))
-        for p in expert.parameters():
-            p.requires_grad = False
-        expert.eval()  # 设置为评估模式（关闭 dropout、batchnorm 等）
-
-        expertnext_obs, _ = expertenvs.reset(seed=args.seed)
-        expertnext_obs = torch.Tensor(expertnext_obs).to(device)
-        for step in range(args.expert_buffersize):
-            expertobs[step] = expertnext_obs
-
-            # get action
-            with torch.no_grad():
-                expertaction, expertlogprob, _ ,_= expert.get_action_and_value(expertnext_obs)
-
-            expertactions[step] = expertaction
-            expertlogprobs[step] = expertlogprob
-
-            expertnext_obs, expertreward, expertterminations, experttruncations, expertinfo = expertenvs.step(
-                expertaction.cpu().numpy())
-
-            expertnext_obs = torch.Tensor(expertnext_obs).to(device)
-        torch.save({
-            "obs": expertobs.clone().cpu(),
-            "actions": expertactions.clone().cpu(),
-            "logprobs": expertlogprobs.clone().cpu()
-        }, args.expert_buffer_path)
-    return expertobs, expertactions, expertlogprobs
-# get expert data
 
 def set_seed(args):
     random.seed(args.seed)
@@ -331,9 +279,20 @@ def main():
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    expertactions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(
+        device)
+
     length_list=[]
-    # get expert data
-    expertobs, expertactions, expertlogprobs = get_expert_data(args,envs, run_name, device)
+
+    # 构造 expert 模型后，加载预训练权重
+    expert = Agent(envs).to(device)
+
+    # 加载预训练模型的参数
+    expert_ckpt_path = args.expert_path  # 你实际的模型路径
+    expert.actor.load_state_dict(torch.load(expert_ckpt_path, map_location=device))
+    for p in expert.parameters():
+        p.requires_grad = False
+    expert.eval()  # 设置为评估模式（关闭 dropout、batchnorm 等）
 
     # start the game
     global_step = 0
@@ -356,7 +315,8 @@ def main():
             # get action
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
-
+                expertaction,_,_,_=expert.get_action_and_value(next_obs)
+            expertactions[step]=expertaction
             actions[step] = action
             logprobs[step] = logprob
             values[step] = value
@@ -377,12 +337,12 @@ def main():
                             "global_step": global_step
                         })
 
-        if iteration % (args.discriminator_epochs + args.policy_epochs) < args.discriminator_epochs:
+        if iteration % (args.discriminator_epochs + args.policy_epochs) <= args.discriminator_epochs:
             replay_dataset = ReplayDataset(
                 obs=obs,
                 actions=actions,
                 logprobs=logprobs,
-                expertobs=expertobs,
+                expertobs=obs,
                 expertactions=expertactions,
             )
             dataloader = DataLoader(replay_dataset, batch_size=args.minibatch_size, shuffle=True)
